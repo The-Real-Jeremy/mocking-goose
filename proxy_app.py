@@ -1,5 +1,8 @@
 # proxy_app.py
 import asyncio
+import base64
+import hmac
+import hashlib
 import os
 import socket
 import subprocess
@@ -7,6 +10,7 @@ import time
 import tempfile
 import shutil
 import json
+import secrets
 from typing import Dict, List, Optional, Tuple
 
 import httpx
@@ -29,36 +33,26 @@ except Exception:
 # ----------------- Config -----------------
 APP_HOST = "0.0.0.0"
 APP_PORT = 8000
-
-# Child apps bind privately; only this proxy is exposed
 BACKEND_HOST = "127.0.0.1"
 
-# Local working tree to COPY for each session
 LOCAL_REPO_DIR = os.environ.get(
     "LOCAL_MOCK_AND_ROLL_DIR",
     "/app/python/source_code/mock-and-roll",
 )
-
-# uv candidates (prefer full path)
 UV_BIN_CANDIDATES = ["/home/app/.local/bin/uv", "uv"]
 
-# Goose binary location
-# Preferred: explicit file path via GOOSE_BIN
-# Next: directory via GOOSE_BIN_DIR (default to /app/python/source_code), we look for a file named "goose"
-# Fallback: PATH
 GOOSE_BIN_ENV = os.environ.get("GOOSE_BIN")
 GOOSE_BIN_DIR = os.environ.get("GOOSE_BIN_DIR", "/app/python/source_code")
 
 # Cookies
-COOKIE_TOKEN_NAME = "goose_token"
-COOKIE_HOST_NAME = "goose_host"
-COOKIE_MAX_AGE = 8 * 60 * 60  # 8 hours
-COOKIE_SECURE = False  # set True behind HTTPS / ingress
+CK_HOST  = "goose_host"     # HTTP-only
+CK_TOKEN = "goose_token"    # HTTP-only (PAT)
+CK_SID   = "goose_sid"      # readable (not HTTP-only)
+CK_SIG   = "goose_sig"      # HMAC for sid
 
-# Idle (60 minutes)
-INACTIVITY_SECS = 60 * 60  # server-side window
+INACTIVITY_SECS = 60 * 60  # 60 minutes
 
-# ----------------- Process state -----------------
+# ----------------- State -----------------
 class BackendInfo:
     def __init__(self, port: int, proc: subprocess.Popen, workdir: str):
         self.port = port
@@ -69,9 +63,69 @@ class BackendInfo:
 backends: Dict[str, BackendInfo] = {}
 lock = asyncio.Lock()
 
-PROCESS_START_TS = time.time()
-WS_CONNECTIONS = 0  # current websocket client connections
+# sid -> (host, token, expires_at)
+SESSIONS: Dict[str, Tuple[str, str, float]] = {}
 
+PROCESS_START_TS = time.time()
+WS_CONNECTIONS = 0
+
+# ----------------- In-process circular debug log -----------------
+_MAX_LOG = 2000
+_debug_lines: List[str] = []
+
+def _dbg(msg: str):
+    ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    line = f"[DBG {ts}] {msg}"
+    print(line)
+    _debug_lines.append(line)
+    if len(_debug_lines) > _MAX_LOG:
+        del _debug_lines[: len(_debug_lines) // 2]
+
+def _mask_pat(pat: Optional[str]) -> str:
+    if not pat:
+        return "<none>"
+    if len(pat) <= 8:
+        return pat[:2] + "…" + pat[-2:]
+    return pat[:4] + "…" + pat[-4:]
+
+# ----------------- HMAC secret -----------------
+def _secret_path() -> str:
+    cfg = os.path.join(os.path.expanduser("~"), ".config", "goose")
+    os.makedirs(cfg, exist_ok=True)
+    return os.path.join(cfg, "proxy_secret")
+
+def _load_or_create_secret() -> bytes:
+    p = _secret_path()
+    if os.path.exists(p):
+        with open(p, "rb") as f:
+            data = f.read()
+            if data:
+                return data
+    key = secrets.token_bytes(32)
+    with open(p, "wb") as f:
+        f.write(key)
+    _dbg("Created new HMAC secret at ~/.config/goose/proxy_secret")
+    return key
+
+HMAC_KEY = _load_or_create_secret()
+
+def _b64u(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+def _sign_sid(sid: str) -> str:
+    mac = hmac.new(HMAC_KEY, sid.encode("utf-8"), hashlib.sha256).digest()
+    return _b64u(mac[:16])
+
+def _verify_sid(sid: str, sig: str) -> bool:
+    try:
+        expected = _sign_sid(sid)
+        return hmac.compare_digest(expected, sig)
+    except Exception:
+        return False
+
+def _new_sid() -> str:
+    raw = secrets.token_bytes(16) + int(time.time()).to_bytes(4, "big")
+    return _b64u(raw)
 
 # ----------------- Helpers -----------------
 def session_key(host: str, token: str) -> str:
@@ -132,45 +186,33 @@ def _locate_uv() -> str:
     return uv
 
 def _locate_goose_bin(workdir: str) -> str:
-    # 1) Explicit env path to file
     if GOOSE_BIN_ENV:
         if (os.path.isabs(GOOSE_BIN_ENV) and os.access(GOOSE_BIN_ENV, os.X_OK)) or shutil.which(GOOSE_BIN_ENV):
             return GOOSE_BIN_ENV
         raise RuntimeError(f"GOOSE_BIN set but not executable: {GOOSE_BIN_ENV}")
 
-    # 2) Env-provided directory (default /app/python/source_code)
     if GOOSE_BIN_DIR:
         candidate = os.path.join(GOOSE_BIN_DIR, "goose")
         if os.path.exists(candidate) and os.access(candidate, os.X_OK):
             return candidate
 
-    # 3) PATH
     g = shutil.which("goose")
     if g:
         return g
 
-    # 4) Last resort: a sibling to workdir (rare)
     maybe = os.path.abspath(os.path.join(workdir, "..", "goose"))
     if os.path.exists(maybe) and os.access(maybe, os.X_OK):
         return maybe
 
-    raise RuntimeError("Could not find 'goose'. Set GOOSE_BIN or GOOSE_BIN_DIR (pointing to a dir containing 'goose').")
-
+    raise RuntimeError("Could not find 'goose'. Set GOOSE_BIN or GOOSE_BIN_DIR.")
 
 def _session_copy_and_sync() -> str:
-    """
-    Prepare a per-session working directory by copying the local working tree,
-    then run `uv python pin 3.13` and `uv sync` inside that dir.
-    Returns the workdir path.
-    """
     if not os.path.isdir(LOCAL_REPO_DIR):
         raise RuntimeError(f"Local repo not found: {LOCAL_REPO_DIR}")
 
     workdir = tempfile.mkdtemp(prefix="mock-and-roll-")
     try:
-        # Replace the empty dir with a copy of the repo (so workdir == repo root)
         shutil.rmtree(workdir, ignore_errors=True)
-
         ignore = shutil.ignore_patterns(
             ".git", ".venv", "__pycache__", ".mypy_cache", ".pytest_cache",
             ".ruff_cache", ".idea", ".vscode"
@@ -179,23 +221,17 @@ def _session_copy_and_sync() -> str:
 
         uv = _locate_uv()
 
-        # --- Pin a Python that pydantic-core wheels support (avoids building with pyo3) ---
-        # This tells uv to use CPython 3.13 for this project (it will download/manage it if needed).
         subprocess.check_call([uv, "python", "pin", "3.13"], cwd=workdir)
 
-        # Extra safety: if something still tries to build from source, allow ABI3 forward-compat.
         env = os.environ.copy()
         env.setdefault("UV_PYTHON", "3.13")
         env.setdefault("PYO3_USE_ABI3_FORWARD_COMPATIBILITY", "1")
 
-        # Install deps
         subprocess.check_call([uv, "sync"], cwd=workdir, env=env)
-
         return workdir
     except Exception as e:
         shutil.rmtree(workdir, ignore_errors=True)
         raise RuntimeError(f"Failed to prepare session copy: {e}") from e
-
 
 def start_backend(host: str, token: str) -> BackendInfo:
     port = get_free_port()
@@ -204,20 +240,15 @@ def start_backend(host: str, token: str) -> BackendInfo:
     env = os.environ.copy()
     env["DATABRICKS_HOST"] = host
     env["DATABRICKS_TOKEN"] = token
-    # Unset client creds
     env.pop("DATABRICKS_CLIENT_ID", None)
     env.pop("DATABRICKS_CLIENT_SECRET", None)
 
     goose_bin = _locate_goose_bin(workdir)
     cmd = [goose_bin, "web", "--host", BACKEND_HOST, "--port", str(port)]
     proc = subprocess.Popen(
-        cmd,
-        cwd=workdir,
-        env=env,
-        stdout=None,
-        stderr=None,
-        text=True,
+        cmd, cwd=workdir, env=env, stdout=None, stderr=None, text=True,
     )
+    _dbg(f"Started Goose backend at {BACKEND_HOST}:{port} for host={host} token={_mask_pat(token)}")
     return BackendInfo(port=port, proc=proc, workdir=workdir)
 
 async def ensure_backend(host: str, token: str) -> BackendInfo:
@@ -235,7 +266,6 @@ def stop_backend_by_key(key: str) -> None:
     info = backends.pop(key, None)
     if not info:
         return
-    # stop process
     if info.proc.poll() is None:
         try:
             info.proc.terminate()
@@ -245,22 +275,16 @@ def stop_backend_by_key(key: str) -> None:
                 info.proc.kill()
             except Exception:
                 pass
-    # remove temp workdir
     try:
         shutil.rmtree(info.workdir, ignore_errors=True)
     except Exception:
         pass
+    _dbg(f"Stopped Goose backend and cleaned workdir for key={key}")
 
 def is_hop_by_hop(h: str) -> bool:
     return h.lower() in {
-        "connection",
-        "keep-alive",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "te",
-        "trailers",
-        "transfer-encoding",
-        "upgrade",
+        "connection","keep-alive","proxy-authenticate","proxy-authorization",
+        "te","trailers","transfer-encoding","upgrade",
     }
 
 def _system_metrics():
@@ -288,7 +312,6 @@ def _process_metrics():
         return {}
 
 def _goose_metrics():
-    # Counts & aggregates across all live Goose processes
     live = 0
     cpu_sum = 0.0
     rss_sum = 0
@@ -307,15 +330,12 @@ def _goose_metrics():
         data.update({"cpu_percent_sum": cpu_sum, "rss_bytes_sum": rss_sum})
     return data
 
-
 # ----------------- App & static -----------------
 app = FastAPI()
 
-# Serve ONLY our UI assets here (avoid /static to not clash with Goose)
 UI_STATIC_DIR = os.path.join(os.path.dirname(__file__), "ui-static")
 os.makedirs(UI_STATIC_DIR, exist_ok=True)
 app.mount("/ui-static", StaticFiles(directory=UI_STATIC_DIR), name="ui-static")
-
 
 @app.on_event("startup")
 async def _start_tasks():
@@ -323,29 +343,75 @@ async def _start_tasks():
         while True:
             try:
                 now = time.monotonic()
+                for sid, (host, token, exp) in list(SESSIONS.items()):
+                    if time.time() > exp:
+                        _dbg(f"[reaper] expiring sid={sid} host={host} token={_mask_pat(token)}")
+                        _kill_session(sid)
                 for key, info in list(backends.items()):
                     if info.proc.poll() is None and (now - info.last_seen) > INACTIVITY_SECS:
+                        _dbg(f"[reaper] stopping idle backend key={key}")
                         stop_backend_by_key(key)
-            except Exception:
-                pass
+            except Exception as e:
+                _dbg(f"[reaper] exception: {e}")
             await asyncio.sleep(60)
-
-    # Mirror refresher removed (we now copy from LOCAL_REPO_DIR)
     asyncio.create_task(idle_reaper())
-
 
 @app.on_event("shutdown")
 async def shutdown():
+    for sid in list(SESSIONS.keys()):
+        _kill_session(sid)
     for key in list(backends.keys()):
         stop_backend_by_key(key)
 
+# ----------------- Cookie utilities -----------------
+def _scheme_from_request(req: Request) -> str:
+    xf_proto = req.headers.get("x-forwarded-proto")
+    if xf_proto:
+        return xf_proto.split(",")[0].strip().lower()
+    return req.url.scheme.lower()
+
+def _set_login_cookies(resp: Response, host: str, token: str, https: bool) -> Tuple[str, str]:
+    sid = _new_sid()
+    sig = _sign_sid(sid)
+    expires_at = time.time() + INACTIVITY_SECS
+    SESSIONS[sid] = (host, token, expires_at)
+
+    resp.set_cookie(CK_TOKEN, token, max_age=8*60*60, httponly=True,
+                    secure=https, samesite=("none" if https else "lax"), path="/")
+    resp.set_cookie(CK_HOST, host,  max_age=8*60*60, httponly=True,
+                    secure=https, samesite=("none" if https else "lax"), path="/")
+    resp.set_cookie(CK_SID, sid, max_age=INACTIVITY_SECS, httponly=False,
+                    secure=https, samesite=("none" if https else "lax"), path="/")
+    resp.set_cookie(CK_SIG, sig, max_age=INACTIVITY_SECS, httponly=False,
+                    secure=https, samesite=("none" if https else "lax"), path="/")
+
+    _dbg(f"Issued session: sid={sid} https={https} host={host} token={_mask_pat(token)} samesite={'None' if https else 'Lax'} secure={https}")
+    return sid, sig
+
+def _refresh_session(resp: Optional[Response], sid: str):
+    if sid not in SESSIONS:
+        return
+    host, token, _ = SESSIONS[sid]
+    SESSIONS[sid] = (host, token, time.time() + INACTIVITY_SECS)
+    if resp is not None:
+        for name in (CK_SID, CK_SIG):
+            val = sid if name == CK_SID else _sign_sid(sid)
+            resp.set_cookie(name, val, max_age=INACTIVITY_SECS, path="/")
+
+def _kill_session(sid: Optional[str]):
+    if not sid:
+        return
+    info = SESSIONS.pop(sid, None)
+    if not info:
+        return
+    host, token, _ = info
+    stop_backend_by_key(session_key(host, token))
+    _dbg(f"Killed session sid={sid} host={host} token={_mask_pat(token)}")
 
 # ----------------- UI -----------------
-
 def render_page(host_val: Optional[str], show_iframe: bool) -> str:
     host_val_safe = (host_val or "").replace('"', "&quot;")
 
-    # Top header shown only when iframe is active (unchanged)
     header_when_active = """
   <div class="header">
     <div class="header-left">
@@ -360,34 +426,34 @@ def render_page(host_val: Optional[str], show_iframe: bool) -> str:
         want to use already exists in the workspace.
       </p>
       <div class="reset-wrap">
+        <a class="reset" href="/_debug" title="Open session status">Session status</a>
         <a class="reset" href="/logout" title="End this session">Reset session</a>
       </div>
     </div>
   </div>
 """
 
-    # Right side panel — formatted sample + bottom-pinned hint
     sidepanel_right = """
   <aside class="sidepanel right" role="complementary" aria-label="Examples">
     <h3 class="sp-title">Try asking:</h3>
 
     <div class="sp-body">
-      <section class="sample"><i>
+      <section class="sample">
+        <h4 class="sample-h">Scentre Group demo</h4>
         <p>
           Hi! Can you please make me a demo of the Databricks platform for
           <b>Scentre Group</b> using the schema <code>goose_scent</code> in the
           catalog <code>jeremy_goose_test</code>? From the eventual gold tables,
-          I should be able to derive:
-          average sqr footage of each space, the revenue per store category,
-          and currently vacant spaces. Please include:
+          I should be able to derive: average sqr footage of each space, the revenue
+          per store category, and currently vacant spaces. Please include:
         </p>
-         * Raw data uploaded to a volume, simulating three source systems
-              (<b>BigQuery</b>, <b>Salesforce</b>, and a 3rd system). Limit to at most
-              five raw tables. <br><br>
-         * A <b>Lakeflow</b> declarative pipeline that transforms data through
-              <b>bronze → silver → gold</b> tables.<br><br>
-         * A <b>Lakeview</b> dashboard showing the KPIs (avg sqr footage, revenue by
-              store category, and vacant spaces).<br></i>
+        <ul class="sample-steps">
+          <li>Raw data uploaded to a volume that simulates three sources
+              (<b>BigQuery</b>, <b>Salesforce</b>, and a 3rd system). Limit to ≤5 raw tables.</li>
+          <li>A <b>Lakeflow</b> declarative pipeline that transforms data
+              <b>bronze → silver → gold</b>.</li>
+          <li>A <b>Lakeview</b> dashboard with KPIs (avg sqr footage, revenue by category, vacancies).</li>
+        </ul>
       </section>
     </div>
 
@@ -395,7 +461,6 @@ def render_page(host_val: Optional[str], show_iframe: bool) -> str:
   </aside>
 """
 
-    # Login card (shown only when no live session)
     form_when_inactive = """
   <form class="card" method="POST" action="/start">
     <div class="logo-wrap">
@@ -429,7 +494,6 @@ def render_page(host_val: Optional[str], show_iframe: bool) -> str:
   </form>
 """
 
-    # Iframe
     iframe_html = (
         '<div class="embed-wrap">'
         '  <iframe id="goose-iframe" class="embed" src="/goose/" title="Goose"></iframe>'
@@ -437,7 +501,6 @@ def render_page(host_val: Optional[str], show_iframe: bool) -> str:
         if show_iframe else ""
     )
 
-    # Active layout: header + two-column (iframe left, samples right)
     layout_when_active = (
         header_when_active +
         '<div class="layout">'
@@ -448,7 +511,6 @@ def render_page(host_val: Optional[str], show_iframe: bool) -> str:
 
     body_html = layout_when_active if show_iframe else form_when_inactive
 
-    # Page template
     template = """
 <!doctype html>
 <html>
@@ -462,22 +524,21 @@ def render_page(host_val: Optional[str], show_iframe: bool) -> str:
 
     body {
       display:flex; flex-direction:column; gap:16px;
-      min-height:100vh; margin:0; padding:16px 16px 20px; /* small bottom gap */
+      min-height:100vh; margin:0; padding:16px 16px 20px;
       background:#0b1020; color:#f6f7fb;
-      align-items:center; /* horizontal center only; allow scroll */
+      align-items:center;
     }
 
     a { color:#ff4d4f; text-decoration:none; }
     a:hover { text-decoration:underline; color:#ff6b6b; }
 
-    /* Card (login) */
     .card {
       background:#121a32; padding:24px; border-radius:16px;
       width:100%; max-width:820px; box-shadow:0 8px 30px rgba(0,0,0,.35);
     }
     .card .logo-wrap { display:flex; justify-content:center; margin-bottom:16px; }
     .logo { height:96px; width:auto; display:block; }
-    .card .logo { height:192px; }  /* 2× on login card */
+    .card .logo { height:192px; }
 
     h1,h2 { margin:0 0 12px; }
     p { opacity:.85; margin:0 0 16px; line-height:1.4; }
@@ -498,7 +559,6 @@ def render_page(host_val: Optional[str], show_iframe: bool) -> str:
     .stack { display:grid; gap:12px; }
     .footer { margin-top:12px; }
 
-    /* Header (active iframe) — unchanged */
     .header {
       width:100%; max-width:1200px;
       display:flex; align-items:center; justify-content:space-between; gap:16px;
@@ -508,7 +568,7 @@ def render_page(host_val: Optional[str], show_iframe: bool) -> str:
     }
     .header-left { display:flex; align-items:center; }
     .logo-wrap { display:flex; align-items:center; gap:10px; }
-    .header .logo { height:120px; }  /* 125% of base */
+    .header .logo { height:120px; }
 
     .header-right {
       flex:1; min-width:260px;
@@ -519,7 +579,7 @@ def render_page(host_val: Optional[str], show_iframe: bool) -> str:
       font-size:.95rem; line-height:1.5; opacity:.95;
       text-align:justify; text-justify:inter-word; hyphens:auto;
     }
-    .reset-wrap { align-self:flex-end; }
+    .reset-wrap { display: flex; gap: 8px; align-self:flex-end; }
     .reset {
       color:#ff4d4f; font-weight:600; text-decoration:none; padding:6px 10px;
       border:1px solid #2a345a; border-radius:10px; background:#0d142b;
@@ -527,7 +587,6 @@ def render_page(host_val: Optional[str], show_iframe: bool) -> str:
     }
     .reset:hover { text-decoration:underline; color:#ff6b6b; }
 
-    /* Two-column layout: iframe (left) + samples (right) */
     .layout {
       width:100%; max-width:1200px;
       display:flex; align-items:stretch; gap:16px;
@@ -557,11 +616,9 @@ def render_page(host_val: Optional[str], show_iframe: bool) -> str:
       background:#121a32; border-radius:16px;
       border:1px solid #2a345a; box-shadow:0 8px 30px rgba(0,0,0,.35);
       min-width:260px;
-      max-height:none;   /* let it grow; iframe column will match */
     }
     .sp-title { margin:0; font-size:1.05rem; }
 
-    /* New: formatted sample card */
     .sp-body { flex:1 1 auto; display:grid; gap:12px; }
     .sample {
       background:#0f1730;
@@ -569,38 +626,23 @@ def render_page(host_val: Optional[str], show_iframe: bool) -> str:
       border-radius:12px;
       padding:12px 14px;
     }
-    .sample-h {
-      color:#ff8a1f;      /* orange heading */
-      margin:0 0 8px;
-      font-size:1rem;
-      font-weight:700;
-    }
-    .sample-steps {
-      list-style: disc;
-      padding-left:18px;
-      margin:8px 0 0;
-      display:grid; gap:6px;
-    }
+    .sample-h { color:#ff8a1f; margin:0 0 8px; font-size:1rem; font-weight:700; }
+    .sample-steps { list-style: disc; padding-left:18px; margin:8px 0 0; display:grid; gap:6px; }
 
     .sp-hint {
-      margin-top:auto;     /* pins this to the bottom of the sidepanel */
+      margin-top:auto;
       font-size:.85rem; opacity:.8;
       border-top:1px dashed #2a345a;
       padding-top:10px;
     }
 
-    @media (max-width: 1100px) {
-      .sidepanel.right { flex-basis:300px; }
-    }
+    @media (max-width: 1100px) { .sidepanel.right { flex-basis:300px; } }
     @media (max-width: 980px) {
       .layout { flex-direction:column; align-items:stretch; }
       .embed-wrap, .sidepanel.right { width:100%; }
       .embed-wrap { display:block; min-height:unset; }
       .embed { height:clamp(480px, 72vh, 980px); flex:none; }
     }
-
-    /* Legacy: orange <b> in older lists (harmless if unused) */
-    .sidepanel.right .sample-list b { color:#ff8a1f; font-weight:700; }
   </style>
 </head>
 <body>
@@ -609,9 +651,8 @@ __BODY__
 
   <script>
     (function(){
-      // ---- Idle/Heartbeat ----
-      const IDLE_MS = 60 * 60 * 1000;   // 60 minutes
-      const HB_MS   = 5 * 60 * 1000;    // heartbeat every 5 minutes
+      const IDLE_MS = 60 * 60 * 1000;
+      const HB_MS   = 5 * 60 * 1000;
 
       let idleTimer = null;
       let hbTimer = null;
@@ -655,7 +696,6 @@ __BODY__
         return false;
       }
 
-      // Activity listeners & init
       ["pointermove","keydown","click","scroll","touchstart","wheel"].forEach(ev =>
         window.addEventListener(ev, activity, {passive:true})
       );
@@ -692,45 +732,125 @@ __BODY__
         .replace("__HOST_VAL__", host_val_safe)
     )
 
-
-
-
-
 # ----------------- Routes -----------------
 @app.get("/_health")
 async def health():
     uptime = int(time.time() - PROCESS_START_TS)
     live_sessions = sum(1 for info in backends.values() if info.proc.poll() is None)
-
     payload = {
         "status": "ok",
         "uptime_seconds": uptime,
-        "server": _system_metrics(),           # system-wide CPU/mem (psutil)
-        "proxy_process": _process_metrics(),   # this FastAPI process stats
-        "goose": _goose_metrics(),             # per-Goose aggregates + instance count
-        "ws_connections": WS_CONNECTIONS,      # current connected websocket clients
-        "live_sessions": live_sessions,        # == goose.instances
+        "server": _system_metrics(),
+        "proxy_process": _process_metrics(),
+        "goose": _goose_metrics(),
+        "ws_connections": WS_CONNECTIONS,
+        "live_sessions": live_sessions,
+        "active_users": len(SESSIONS),
     }
+    return Response(content=json.dumps(payload, indent=2, sort_keys=True) + "\n", media_type="application/json")
+
+@app.get("/_debug")
+async def debug_html(request: Request):
+    sid = request.cookies.get(CK_SID)
+    sig = request.cookies.get(CK_SIG)
+    host = request.cookies.get(CK_HOST)
+    tok  = request.cookies.get(CK_TOKEN)
+    ok_sig = bool(sid and sig and _verify_sid(sid, sig))
+    sess = SESSIONS.get(sid) if sid else None
+    sess_host = sess[0] if sess else None
+    sess_tok  = sess[1] if sess else None
+    sess_exp  = sess[2] if sess else None
+    live = bool(sess and has_live_session(sess_host, sess_tok))
+    port = backends.get(session_key(sess_host, sess_tok)).port if live else None
+    now = time.time()
+    exp_in = (sess_exp - now) if sess_exp else None
+
+    html = f"""
+    <html><head><title>Session debug</title>
+      <style>
+        body {{ font-family: ui-sans-serif, system-ui; padding:20px; background:#0b1020; color:#e9ecff; }}
+        code {{ background:#0d142b; padding:2px 6px; border-radius:6px; border:1px solid #2a345a; }}
+        .wrap {{ display:grid; gap:12px; max-width:1100px; }}
+        .card {{ background:#121a32; border:1px solid #2a345a; border-radius:12px; padding:16px; }}
+        h2 {{ margin:0 0 8px; color:#ff8a1f; }}
+        pre {{ white-space:pre-wrap; word-break:break-word; }}
+      </style>
+    </head><body>
+      <div class="wrap">
+        <div class="card">
+          <h2>Cookies</h2>
+          <div>CK_SID: <code>{sid or '<none>'}</code></div>
+          <div>CK_SIG valid: <code>{ok_sig}</code></div>
+          <div>CK_HOST: <code>{host or '<none>'}</code></div>
+          <div>CK_TOKEN: <code>{_mask_pat(tok)}</code></div>
+        </div>
+        <div class="card">
+          <h2>Server session</h2>
+          <div>exists: <code>{bool(sess)}</code></div>
+          <div>sess.host: <code>{sess_host or '<none>'}</code></div>
+          <div>sess.token: <code>{_mask_pat(sess_tok)}</code></div>
+          <div>expires in (s): <code>{None if exp_in is None else int(exp_in)}</code></div>
+          <div>has_live_session: <code>{live}</code></div>
+          <div>backend.port: <code>{port or '<none>'}</code></div>
+        </div>
+        <div class="card">
+          <h2>Recent debug log (last 20)</h2>
+          <pre>{chr(10).join(_debug_lines[-20:])}</pre>
+        </div>
+      </div>
+    </body></html>
+    """
+    return HTMLResponse(html)
+
+@app.get("/_debug.json")
+async def debug_json(request: Request):
+    sid = request.cookies.get(CK_SID)
+    sig = request.cookies.get(CK_SIG)
+    host = request.cookies.get(CK_HOST)
+    tok  = request.cookies.get(CK_TOKEN)
+    ok_sig = bool(sid and sig and _verify_sid(sid, sig))
+    sess = SESSIONS.get(sid) if sid else None
+    sess_host = sess[0] if sess else None
+    sess_tok  = sess[1] if sess else None
+    sess_exp  = sess[2] if sess else None
+    live = bool(sess and has_live_session(sess_host, sess_tok))
+    port = backends.get(session_key(sess_host, sess_tok)).port if live else None
+    now = time.time()
+    exp_in = (sess_exp - now) if sess_exp else None
 
     return Response(
-        content=json.dumps(payload, indent=2, sort_keys=True) + "\n",
-        media_type="application/json",
+        content=json.dumps({
+            "cookies": { CK_SID: sid, CK_SIG: sig, CK_HOST: host, CK_TOKEN: _mask_pat(tok), "sig_valid": ok_sig },
+            "session": {
+                "exists": bool(sess),
+                "host": sess_host,
+                "token_masked": _mask_pat(sess_tok),
+                "expires_in_seconds": None if exp_in is None else int(exp_in),
+                "has_live_session": live,
+                "backend_port": port,
+            },
+            "recent_debug": _debug_lines[-50:],
+        }, indent=2),
+        media_type="application/json"
     )
-
 
 @app.get("/")
 async def home(request: Request):
-    token = request.cookies.get(COOKIE_TOKEN_NAME)
-    host = request.cookies.get(COOKIE_HOST_NAME)
-    # Only show iframe if there is a LIVE session entry (don't auto-restart after idle)
+    token = request.cookies.get(CK_TOKEN)
+    host  = request.cookies.get(CK_HOST)
     show_iframe = bool(token and host and has_live_session(host, token))
     if show_iframe:
         touch_session(host, token)
-    return HTMLResponse(render_page(request.cookies.get(COOKIE_HOST_NAME), show_iframe))
 
+    sid = request.cookies.get(CK_SID)
+    sig = request.cookies.get(CK_SIG)
+    resp = HTMLResponse(render_page(request.cookies.get(CK_HOST), show_iframe))
+    if sid and sig and _verify_sid(sid, sig) and sid in SESSIONS:
+        _refresh_session(resp, sid)
+    return resp
 
 @app.post("/start")
-async def start(host: str = Form(...), token: str = Form(...)):
+async def start(request: Request, host: str = Form(...), token: str = Form(...)):
     try:
         host = normalize_host(host)
     except Exception as e:
@@ -742,43 +862,47 @@ async def start(host: str = Form(...), token: str = Form(...)):
     except Exception as e:
         return PlainTextResponse(f"Failed to start backend: {e}", status_code=502)
 
+    https = (_scheme_from_request(request) == "https")
     resp = RedirectResponse("/", status_code=303)
-    resp.set_cookie(COOKIE_TOKEN_NAME, token, max_age=COOKIE_MAX_AGE, httponly=True, secure=COOKIE_SECURE, samesite="lax")
-    resp.set_cookie(COOKIE_HOST_NAME, host,  max_age=COOKIE_MAX_AGE, httponly=True, secure=COOKIE_SECURE, samesite="lax")
+    sid, sig = _set_login_cookies(resp, host, token, https=https)
+    _dbg(f"/start -> sid={sid} cookies set (https={https})")
     return resp
-
 
 @app.get("/logout")
 async def logout(request: Request):
-    token = request.cookies.get(COOKIE_TOKEN_NAME)
-    host = request.cookies.get(COOKIE_HOST_NAME)
-    if token and host:
-        stop_backend_by_key(session_key(host, token))
+    sid = request.cookies.get(CK_SID)
+    _kill_session(sid)
+
     resp = RedirectResponse("/", status_code=303)
-    resp.delete_cookie(COOKIE_TOKEN_NAME)
-    resp.delete_cookie(COOKIE_HOST_NAME)
+    for name in (CK_TOKEN, CK_HOST, CK_SID, CK_SIG):
+        resp.delete_cookie(name, path="/")
     return resp
 
-
-# ----------------- Idle control -----------------
 @app.post("/heartbeat")
 async def heartbeat(request: Request):
-    token = request.cookies.get(COOKIE_TOKEN_NAME)
-    host = request.cookies.get(COOKIE_HOST_NAME)
-    if token and host and has_live_session(host, token):
-        touch_session(host, token)
+    sid = request.cookies.get(CK_SID)
+    sig = request.cookies.get(CK_SIG)
+    if sid and sig and _verify_sid(sid, sig) and sid in SESSIONS:
+        host, token, _ = SESSIONS[sid]
+        if has_live_session(host, token):
+            touch_session(host, token)
+            _refresh_session(None, sid)
     return Response(status_code=204)
-
 
 # ----------------- HTTP proxy under /goose/... -----------------
 @app.api_route("/goose", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
 @app.api_route("/goose/", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
 @app.api_route("/goose/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
 async def http_proxy(request: Request, path: str = ""):
-    token = request.cookies.get(COOKIE_TOKEN_NAME)
-    host = request.cookies.get(COOKIE_HOST_NAME)
-    # If no live session, don't auto-start — force login
-    if not token or not host or not has_live_session(host, token):
+    sid = request.cookies.get(CK_SID)
+    sig = request.cookies.get(CK_SIG)
+    if not (sid and sig and _verify_sid(sid, sig) and sid in SESSIONS):
+        _dbg(f"[http_proxy] no/invalid sid for path='/{path}' -> redirect")
+        return RedirectResponse("/", status_code=303)
+
+    host, token, exp = SESSIONS[sid]
+    if time.time() > exp or not has_live_session(host, token):
+        _dbg(f"[http_proxy] expired or no live session. host={host} token={_mask_pat(token)}")
         return RedirectResponse("/", status_code=303)
 
     backend = backends[session_key(host, token)]
@@ -797,12 +921,12 @@ async def http_proxy(request: Request, path: str = ""):
     headers.pop("expect", None)
 
     body = await request.body()
-
     async with httpx.AsyncClient(timeout=None) as client:
         try:
             req = client.build_request(request.method, target, headers=headers, content=body)
             upstream = await client.send(req, stream=False)
         except httpx.HTTPError as e:
+            _dbg(f"[http_proxy] upstream error: {e}")
             return PlainTextResponse(f"Upstream error: {e}", status_code=502)
 
         resp = Response(
@@ -810,6 +934,8 @@ async def http_proxy(request: Request, path: str = ""):
             status_code=upstream.status_code,
             media_type=upstream.headers.get("content-type"),
         )
+        _refresh_session(resp, sid)
+
         for k_bytes, v_bytes in upstream.headers.raw:
             k = k_bytes.decode("latin-1")
             v = v_bytes.decode("latin-1")
@@ -818,81 +944,87 @@ async def http_proxy(request: Request, path: str = ""):
             resp.raw_headers.append((k.encode("latin-1"), v.encode("latin-1")))
         return resp
 
-
 # ----------------- WebSocket proxies -----------------
 def _parse_subprotocols(header_val: Optional[str]) -> List[str]:
     if not header_val:
         return []
     return [p.strip() for p in header_val.split(",") if p.strip()]
 
-def _ws_forward_headers(ws: WebSocket, backend_port: int) -> List[Tuple[str, str]]:
-    skip = {
-        "connection",
-        "upgrade",
-        "sec-websocket-key",
-        "sec-websocket-version",
-        "sec-websocket-extensions",
-        "sec-websocket-protocol",
-        "host",
-    }
-    hdrs: List[Tuple[str, str]] = []
-    for k, v in ws.headers.items():
-        kl = k.lower()
-        if kl in skip or is_hop_by_hop(k):
-            continue
-        hdrs.append((k, v))
-    hdrs.append(("Host", f"{BACKEND_HOST}:{backend_port}"))
-    return hdrs
-
-# Some apps use absolute '/ws'
 @app.websocket("/ws")
 async def ws_root(websocket: WebSocket):
     await _ws_bridge(websocket, upstream_path="ws")
 
-# Others use relative paths under the iframe '/goose/...'
 @app.websocket("/goose/{path:path}")
 async def ws_under_goose(websocket: WebSocket, path: str):
     await _ws_bridge(websocket, upstream_path=path)
 
 async def _ws_bridge(websocket: WebSocket, upstream_path: str):
-    token = websocket.cookies.get(COOKIE_TOKEN_NAME)
-    host = websocket.cookies.get(COOKIE_HOST_NAME)
+    sid = websocket.cookies.get(CK_SID)
+    sig = websocket.cookies.get(CK_SIG)
+    have_sid = sid is not None
+    have_sig = sig is not None
+    sig_ok = bool(have_sid and have_sig and _verify_sid(sid, sig))
+    sess = SESSIONS.get(sid) if sig_ok else None
 
-    # If no live session, close without auto-restarting
-    if not token or not host or not has_live_session(host, token):
-        await websocket.close(code=4401)  # Unauthorized/expired
+    if not sig_ok or not sess:
+        _dbg(f"[ws] 403 sid_present={have_sid} sig_present={have_sig} sig_ok={sig_ok} sess_exists={bool(sess)} path='/{upstream_path}'")
+        await websocket.close(code=4401)
+        return
+
+    host, token, exp = sess
+    live = has_live_session(host, token)
+    if time.time() > exp or not live:
+        _dbg(f"[ws] 403 live={live} expired={time.time()>exp} host={host} token={_mask_pat(token)}")
+        await websocket.close(code=4401)
         return
 
     backend = backends[session_key(host, token)]
-
-    # Build upstream ws URL
     target = f"ws://{BACKEND_HOST}:{backend.port}/{upstream_path}"
     if websocket.url.query:
         target += f"?{websocket.url.query}"
 
     offered = _parse_subprotocols(websocket.headers.get("sec-websocket-protocol"))
-    extra_headers = _ws_forward_headers(websocket, backend.port)
 
+    # Try with headers first (for modern websockets lib), then fall back without them.
     try:
         upstream = await websockets.connect(
             target,
-            extra_headers=extra_headers,
+            # Some websockets versions accept extra_headers; others don't.
+            extra_headers=[("Host", f"{BACKEND_HOST}:{backend.port}")],
             subprotocols=offered if offered else None,
             open_timeout=15,
             ping_interval=None,
             max_size=None,
         )
-    except Exception:
-        await websocket.close(code=1013)  # Try again later
+    except TypeError as e:
+        # Old or different lib: retry without extra_headers.
+        _dbg(f"[ws] connect kwargs incompatible; retrying without extra_headers: {e}")
+        try:
+            upstream = await websockets.connect(
+                target,
+                subprotocols=offered if offered else None,
+                open_timeout=15,
+                ping_interval=None,
+                max_size=None,
+            )
+        except Exception as e2:
+            _dbg(f"[ws] upstream connect error -> 1013 (no-headers path): {e2}")
+            await websocket.close(code=1013)
+            return
+    except Exception as e:
+        _dbg(f"[ws] upstream connect error -> 1013: {e}")
+        await websocket.close(code=1013)
         return
 
-    # Accept client & track live connection count
     global WS_CONNECTIONS
     try:
         await websocket.accept(subprotocol=upstream.subprotocol)
         WS_CONNECTIONS += 1
         touch_session(host, token)
-    except Exception:
+        SESSIONS[sid] = (host, token, time.time() + INACTIVITY_SECS)
+        _dbg(f"[ws] accepted; bridged to {BACKEND_HOST}:{backend.port} path='/{upstream_path}' sid={sid}")
+    except Exception as e:
+        _dbg(f"[ws] accept error: {e}")
         await upstream.close()
         return
 
@@ -907,6 +1039,7 @@ async def _ws_bridge(websocket: WebSocket, upstream_path: str):
                     elif msg.get("bytes") is not None:
                         await upstream.send(msg["bytes"])
                     touch_session(host, token)
+                    SESSIONS[sid] = (host, token, time.time() + INACTIVITY_SECS)
                 elif t == "websocket.disconnect":
                     try:
                         await upstream.close()
@@ -926,6 +1059,7 @@ async def _ws_bridge(websocket: WebSocket, upstream_path: str):
                 else:
                     await websocket.send_bytes(data)
                 touch_session(host, token)
+                SESSIONS[sid] = (host, token, time.time() + INACTIVITY_SECS)
         except Exception:
             try:
                 await websocket.close()
@@ -937,19 +1071,21 @@ async def _ws_bridge(websocket: WebSocket, upstream_path: str):
     finally:
         WS_CONNECTIONS -= 1
 
-
 # ----------------- Absolute-path asset proxy -----------------
-# Keep LAST so specific routes above win first.
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"])
 async def absolute_proxy(request: Request, path: str):
-    token = request.cookies.get(COOKIE_TOKEN_NAME)
-    host = request.cookies.get(COOKIE_HOST_NAME)
-
-    # If no live session, don't auto-restart — send back to login
-    if not token or not host or not has_live_session(host, token):
+    sid = request.cookies.get(CK_SID)
+    sig = request.cookies.get(CK_SIG)
+    if not (sid and sig and _verify_sid(sid, sig) and sid in SESSIONS):
         if path == "" or "text/html" in request.headers.get("accept", ""):
+            _dbg(f"[abs] redirect (no session) path='/{path}'")
             return RedirectResponse("/", status_code=303)
         return PlainTextResponse("Not found", status_code=404)
+
+    host, token, exp = SESSIONS[sid]
+    if time.time() > exp or not has_live_session(host, token):
+        _dbg(f"[abs] expired/no-live redirect path='/{path}'")
+        return RedirectResponse("/", status_code=303)
 
     backend = backends[session_key(host, token)]
     touch_session(host, token)
@@ -963,16 +1099,8 @@ async def absolute_proxy(request: Request, path: str):
         for k, v in request.headers.items()
         if k.lower()
         not in {
-            "connection",
-            "keep-alive",
-            "proxy-authenticate",
-            "proxy-authorization",
-            "te",
-            "trailers",
-            "transfer-encoding",
-            "upgrade",
-            "content-length",
-            "accept-encoding",
+            "connection","keep-alive","proxy-authenticate","proxy-authorization",
+            "te","trailers","transfer-encoding","upgrade","content-length","accept-encoding",
         }
     }
     headers["host"] = f"{BACKEND_HOST}:{backend.port}"
@@ -985,6 +1113,7 @@ async def absolute_proxy(request: Request, path: str):
             req = client.build_request(request.method, target, headers=headers, content=body)
             upstream = await client.send(req, stream=False)
         except httpx.HTTPError as e:
+            _dbg(f"[abs] upstream error: {e}")
             return PlainTextResponse(f"Upstream error: {e}", status_code=502)
 
         resp = Response(
@@ -992,49 +1121,42 @@ async def absolute_proxy(request: Request, path: str):
             status_code=upstream.status_code,
             media_type=upstream.headers.get("content-type"),
         )
-        # Preserve duplicates (e.g., multiple Set-Cookie)
+        _refresh_session(resp, sid)
         for k_bytes, v_bytes in upstream.headers.raw:
             k = k_bytes.decode("latin-1")
             v = v_bytes.decode("latin-1")
             if k.lower() in {
-                "connection",
-                "keep-alive",
-                "proxy-authenticate",
-                "proxy-authorization",
-                "te",
-                "trailers",
-                "transfer-encoding",
-                "upgrade",
-                "content-length",
+                "connection","keep-alive","proxy-authenticate","proxy-authorization",
+                "te","trailers","transfer-encoding","upgrade","content-length",
             }:
                 continue
             resp.raw_headers.append((k.encode("latin-1"), v.encode("latin-1")))
         return resp
 
-MCP_DIR = "/app/python/source_code/awesome-databricks-mcp"  # adjust if different
+# ----------------- MCP prep -----------------
+MCP_DIR = "/app/python/source_code/awesome-databricks-mcp"
+
+def _locate_uv_or_warn() -> Optional[str]:
+    try:
+        return _locate_uv()
+    except Exception as e:
+        _dbg(f"[warn] uv not found: {e}")
+        return None
 
 def prepare_mcp_env() -> None:
-    """
-    Ensure the awesome-databricks-mcp project uses Python 3.13 and is synced
-    so Goose doesn't try to build pydantic-core for 3.14.
-    Safe to call repeatedly.
-    """
     if not os.path.isdir(MCP_DIR):
-        return  # silently skip if not present
-
-    uv = _locate_uv()
-
+        return
+    uv = _locate_uv_or_warn()
+    if not uv:
+        return
     env = os.environ.copy()
     env.setdefault("UV_PYTHON", "3.13")
     env.setdefault("PYO3_USE_ABI3_FORWARD_COMPATIBILITY", "1")
-
     try:
-        # Pin & sync once so `uv run --directory ...` uses a 3.13 env
         subprocess.check_call([uv, "python", "pin", "3.13"], cwd=MCP_DIR, env=env)
         subprocess.check_call([uv, "sync"], cwd=MCP_DIR, env=env)
     except subprocess.CalledProcessError as e:
-        # Non-fatal: Goose will still try to run; but likely we want to know.
-        print(f"[warn] MCP env prep failed: {e}")
+        _dbg(f"[warn] MCP env prep failed: {e}")
 
 config_text = """GOOSE_MODEL: databricks-claude-sonnet-4
 extensions:
@@ -1104,26 +1226,21 @@ GOOSE_PROVIDER: databricks
 """
 
 if __name__ == "__main__":
-    # Note: uvicorn.run() is a blocking call (it runs the event loop until exit).
-
     config_dir = "/home/app/.config/goose"
     os.makedirs(config_dir, exist_ok=True)
-
     with open(os.path.join(config_dir, "config.yaml"), "w") as f:
         f.write(config_text)
 
-    result = subprocess.run(
+    subprocess.run(
         """
         unset DATABRICKS_CLIENT_ID;
         unset DATABRICKS_CLIENT_SECRET;
-        curl -fsSL https://github.com/block/goose/releases/download/stable/download_cli.sh | CONFIGURE=false GOOSE_BIN_DIR=/app/python/source_code bash;
+        curl -fsSL https://github.com/block/goose/releases/download/v1.10.3/download_cli.sh | CONFIGURE=false GOOSE_BIN_DIR=/app/python/source_code bash;
         curl -LsSf https://astral.sh/uv/install.sh | sh;
         """,
         shell=True,
         text=True
     )
 
-    # Prepare the MCP env (pin 3.13 + sync) so the extension won’t compile against 3.14
     prepare_mcp_env()
-        
     uvicorn.run("proxy_app:app", host=APP_HOST, port=APP_PORT, reload=False)
